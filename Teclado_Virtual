@@ -1,0 +1,564 @@
+import cv2
+import mediapipe as mp
+import numpy as np
+import time
+import winsound
+import os
+import statistics
+
+# Configuración inicial
+mp_face_mesh = mp.solutions.face_mesh
+mp_drawing = mp.solutions.drawing_utils
+mp_drawing_styles = mp.solutions.drawing_styles
+
+# Constantes
+EAR_THRESHOLD = 0.18
+CONSECUTIVE_FRAMES = 2
+KEY_SIZE = 60
+KEY_MARGIN = 5
+SCREEN_WIDTH = 1280
+SCREEN_HEIGHT = 720
+TEXT_AREA_HEIGHT = 100
+KEYBOARD_Y = TEXT_AREA_HEIGHT + 50
+DWELL_TIME = 1.5
+
+# Teclado QWERTY con espacio y enter
+KEYBOARD = [
+    ['Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P'],
+    ['A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', '<'],
+    ['Z', 'X', 'C', 'V', 'B', 'N', 'M', '_'],
+    ['SPACE', 'ENTER']  # Nueva fila con espacio y enter
+]
+
+# Índices de los landmarks
+LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
+LEFT_IRIS_INDICES = [468, 469, 470, 471, 472]
+RIGHT_IRIS_INDICES = [473, 474, 475, 476, 477]
+
+class EyeTracker:
+    def __init__(self):
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+        self.cursor_pos_history = []
+        self.SMOOTHING_WINDOW = 150  # Ventana aumentada para mejor suavizado
+        self.MOVEMENT_THRESHOLD = 25  # Umbral de movimiento mínimo aumentado
+        self.calibration_points = []
+        self.calibration_complete = False
+        self.calibration_stage = 0
+        self.calibration_start_time = 0
+        self.last_valid_cursor = (SCREEN_WIDTH//2, SCREEN_HEIGHT//2)
+        self.calibration_model = None
+        self.stability_counter = 0
+        self.last_update_time = time.time()
+        self.cursor_stable_pos = self.last_valid_cursor  # Posición estable para suavizado adicional
+
+    def calculate_ear(self, landmarks, eye_indices):
+        p1 = np.array([landmarks[eye_indices[0]].x, landmarks[eye_indices[0]].y])
+        p2 = np.array([landmarks[eye_indices[1]].x, landmarks[eye_indices[1]].y])
+        p3 = np.array([landmarks[eye_indices[2]].x, landmarks[eye_indices[2]].y])
+        p4 = np.array([landmarks[eye_indices[3]].x, landmarks[eye_indices[3]].y])
+        p5 = np.array([landmarks[eye_indices[4]].x, landmarks[eye_indices[4]].y])
+        p6 = np.array([landmarks[eye_indices[5]].x, landmarks[eye_indices[5]].y])
+        
+        dist1 = np.linalg.norm(p2 - p6)
+        dist2 = np.linalg.norm(p3 - p5)
+        dist3 = np.linalg.norm(p1 - p4)
+        
+        return (dist1 + dist2) / (2.0 * dist3)
+
+    def get_iris_center(self, landmarks, iris_indices):
+        points = np.array([(landmarks[i].x, landmarks[i].y) for i in iris_indices])
+        return np.mean(points, axis=0)
+    
+    def calibrate(self, frame, gaze_vector):
+        current_time = time.time()
+        
+        if self.calibration_stage == 0:
+            self.calibration_stage = 1
+            self.calibration_start_time = current_time
+            self.calibration_points = []
+            self.calibration_targets = []
+        
+        cv2.putText(frame, "Mire al punto rojo", (SCREEN_WIDTH//2 - 150, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        calibration_targets = [
+            (SCREEN_WIDTH//4, SCREEN_HEIGHT//4),
+            (3*SCREEN_WIDTH//4, SCREEN_HEIGHT//4),
+            (SCREEN_WIDTH//4, 3*SCREEN_HEIGHT//4),
+            (3*SCREEN_WIDTH//4, 3*SCREEN_HEIGHT//4),
+            (SCREEN_WIDTH//2, SCREEN_HEIGHT//2)
+        ]
+        
+        target_x, target_y = calibration_targets[self.calibration_stage - 1]
+        cv2.circle(frame, (target_x, target_y), 15, (0, 0, 255), -1)
+        
+        if current_time - self.calibration_start_time > 2.0:
+            self.calibration_points.append(gaze_vector)
+            self.calibration_targets.append((target_x / SCREEN_WIDTH, target_y / SCREEN_HEIGHT))
+            
+            self.calibration_stage += 1
+            self.calibration_start_time = current_time
+            winsound.Beep(500, 100)
+            
+            if self.calibration_stage > 5:
+                self.calibrate_linear_model()
+                self.calibration_complete = True
+                winsound.Beep(1000, 500)
+                return True
+        
+        return False
+    
+    def calibrate_linear_model(self):
+        gaze_x = [g[0] for g in self.calibration_points]
+        gaze_y = [g[1] for g in self.calibration_points]
+        target_x = [t[0] for t in self.calibration_targets]
+        target_y = [t[1] for t in self.calibration_targets]
+        
+        A = np.vstack([gaze_x, gaze_y, np.ones(len(gaze_x))]).T
+        self.model_x = np.linalg.lstsq(A, target_x, rcond=None)[0]
+        self.model_y = np.linalg.lstsq(A, target_y, rcond=None)[0]
+    
+    def map_gaze_to_screen(self, gaze_vector):
+        if not self.calibration_complete:
+            return None
+            
+        x, y = gaze_vector
+        pred_x = self.model_x[0]*x + self.model_x[1]*y + self.model_x[2]
+        pred_y = self.model_y[0]*x + self.model_y[1]*y + self.model_y[2]
+        
+        screen_x = int(pred_x * SCREEN_WIDTH)
+        screen_y = int(pred_y * SCREEN_HEIGHT)
+        screen_x = max(0, min(SCREEN_WIDTH - 1, screen_x))
+        screen_y = max(0, min(SCREEN_HEIGHT - 1, screen_y))
+        
+        return (screen_x, screen_y)
+    
+    def detect_gaze(self, frame):
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(frame_rgb)
+        cursor_pos = self.last_valid_cursor
+
+        if results.multi_face_landmarks:
+            try:
+                landmarks = results.multi_face_landmarks[0].landmark
+                
+                left_iris = self.get_iris_center(landmarks, LEFT_IRIS_INDICES)
+                right_iris = self.get_iris_center(landmarks, RIGHT_IRIS_INDICES)
+                iris_center = (left_iris + right_iris) / 2.0
+                gaze_vector = (iris_center[0], iris_center[1])
+                
+                if not self.calibration_complete:
+                    self.calibrate(frame, gaze_vector)
+                    return cursor_pos
+                
+                new_cursor_pos = self.map_gaze_to_screen(gaze_vector)
+                
+                if new_cursor_pos:
+                    # Filtrar actualizaciones demasiado rápidas
+                    current_time = time.time()
+                    if current_time - self.last_update_time < 0.05:  # 20 FPS máximo
+                        return cursor_pos
+                    self.last_update_time = current_time
+                    
+                    if self.last_valid_cursor:
+                        dx = new_cursor_pos[0] - self.last_valid_cursor[0]
+                        dy = new_cursor_pos[1] - self.last_valid_cursor[1]
+                        distance = np.sqrt(dx*dx + dy*dy)
+                        
+                        if distance < self.MOVEMENT_THRESHOLD:
+                            cursor_pos = self.last_valid_cursor
+                            self.stability_counter += 1
+                        else:
+                            cursor_pos = new_cursor_pos
+                            self.stability_counter = 0
+                    else:
+                        cursor_pos = new_cursor_pos
+                        self.stability_counter = 0
+                    
+                    self.last_valid_cursor = cursor_pos
+                
+                # Suavizado avanzado con filtro de mediana y media móvil exponencial
+                if cursor_pos:
+                    self.cursor_pos_history.append(cursor_pos)
+                    if len(self.cursor_pos_history) > self.SMOOTHING_WINDOW:
+                        self.cursor_pos_history.pop(0)
+                    
+                    if self.cursor_pos_history:
+                        # Suavizado con mediana para eliminar outliers
+                        smoothed_x = statistics.median([p[0] for p in self.cursor_pos_history])
+                        smoothed_y = statistics.median([p[1] for p in self.cursor_pos_history])
+                        
+                        # Suavizado adicional con media móvil exponencial
+                        alpha = 0.8  # Factor de suavizado (mayor = más suave)
+                        self.cursor_stable_pos = (
+                            int(alpha * self.cursor_stable_pos[0] + (1 - alpha) * smoothed_x),
+                            int(alpha * self.cursor_stable_pos[1] + (1 - alpha) * smoothed_y)
+                        )
+                        
+                        # Usar la posición suavizada si hay suficiente estabilidad
+                        if self.stability_counter > 10:
+                            cursor_pos = self.cursor_stable_pos
+                        else:
+                            # Interpolación para movimientos rápidos
+                            beta = 0.3
+                            x_coord = int(self.cursor_stable_pos[0] * beta + cursor_pos[0] * (1 - beta))
+                            y_coord = int(self.cursor_stable_pos[1] * beta + cursor_pos[1] * (1 - beta))
+                            cursor_pos = (x_coord, y_coord)
+                        
+                        self.last_valid_cursor = cursor_pos
+            
+            except Exception as e:
+                print(f"Error en detección ocular: {e}")
+                cursor_pos = self.last_valid_cursor
+        else:
+            cursor_pos = self.last_valid_cursor
+
+        return cursor_pos
+
+class VirtualKeyboard:
+    def __init__(self):
+        self.text = ""  # Texto actual en edición
+        self.final_text = ""  # Texto enviado con enter
+        self.suggestions = []
+        self.keyboard = KEYBOARD
+        self.keys = self.create_keys()
+        self.last_key_press_time = 0
+        self.prediction_words = self.load_word_list("palabras.txt")
+        self.current_key = None
+        self.key_start_time = 0
+        self.current_suggestion = None
+        self.suggestion_start_time = 0
+        self.selection_cooldown = 0.5
+        self.last_suggestion_selected_time = 0
+    
+    def load_word_list(self, filename):
+        if not os.path.exists(filename):
+            return []
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return [line.strip().upper() for line in f.readlines() if line.strip()]
+        except:
+            return []
+    
+    def create_keys(self):
+        keys = []
+        start_y = KEYBOARD_Y
+        
+        for row_idx, row in enumerate(self.keyboard):
+            num_keys = len(row)
+            
+            # Ancho especial para teclas grandes
+            key_widths = [KEY_SIZE] * num_keys
+            if row_idx == 3:  # Última fila (espacio y enter)
+                key_widths = [KEY_SIZE * 4, KEY_SIZE * 4]  # Teclas más anchas
+            
+            total_width = sum(key_widths) + (num_keys - 1) * KEY_MARGIN
+            start_x = (SCREEN_WIDTH - total_width) // 2
+            
+            for col_idx, key in enumerate(row):
+                key_x = start_x + sum(key_widths[:col_idx]) + col_idx * KEY_MARGIN
+                key_y = start_y + row_idx * (KEY_SIZE + KEY_MARGIN)
+                width = key_widths[col_idx]
+                
+                keys.append({
+                    'char': key,
+                    'pos': (key_x, key_y),
+                    'size': (width, KEY_SIZE),
+                    'selected': False,
+                    'dwell_progress': 0,
+                    'dwell_start': 0,
+                    'last_selected': 0
+                })
+        
+        return keys
+    
+    def get_selected_key(self, cursor_pos):
+        if cursor_pos is None:
+            return None
+            
+        for key in self.keys:
+            x, y = key['pos']
+            w, h = key['size']
+            
+            if (x <= cursor_pos[0] <= x + w and 
+                y <= cursor_pos[1] <= y + h):
+                return key
+        
+        return None
+    
+    def handle_key_press(self, key):
+        if key is None:
+            return
+            
+        current_time = time.time()
+        if current_time - key['last_selected'] < self.selection_cooldown:
+            return
+            
+        winsound.Beep(440, 100)
+        
+        if key['char'] == '<':
+            self.text = self.text[:-1]  # Borrar último carácter
+        elif key['char'] == '_':
+            self.text += ' '  # Espacio
+        elif key['char'] == 'SPACE':
+            self.text += ' '  # Espacio con barra espaciadora
+        elif key['char'] == 'ENTER':
+            # Al presionar enter, mover el texto actual al texto final
+            self.final_text += self.text + ' '
+            self.text = ""
+        else:
+            self.text += key['char']  # Carácter normal
+        
+        self.update_suggestions()
+        key['selected'] = True
+        key['dwell_progress'] = 0
+        key['last_selected'] = current_time
+        self.last_key_press_time = current_time
+        self.current_key = None
+    
+    def update_dwell_times(self, cursor_pos):
+        current_time = time.time()
+        key = self.get_selected_key(cursor_pos)
+        suggestion = self.get_suggestion_at_pos(cursor_pos)
+        
+        if cursor_pos is None:
+            for k in self.keys:
+                k['dwell_progress'] = 0
+            self.current_key = None
+            return
+        
+        # Manejar teclas
+        if key:
+            if current_time - key['last_selected'] < self.selection_cooldown:
+                key['dwell_progress'] = 0
+                self.current_key = None
+            else:    
+                if key != self.current_key:
+                    self.current_key = key
+                    key['dwell_start'] = current_time
+                    key['dwell_progress'] = 0
+                else:
+                    elapsed = current_time - key['dwell_start']
+                    key['dwell_progress'] = min(elapsed / DWELL_TIME, 1.0)
+                    
+                    if elapsed >= DWELL_TIME:
+                        self.handle_key_press(key)
+                        key['dwell_start'] = current_time
+        else:
+            self.current_key = None
+            for k in self.keys:
+                k['dwell_progress'] = 0
+        
+        # Manejar sugerencias
+        if suggestion:
+            if current_time - self.last_suggestion_selected_time < self.selection_cooldown:
+                self.current_suggestion = None
+                return
+                
+            if suggestion != self.current_suggestion:
+                self.current_suggestion = suggestion
+                self.suggestion_start_time = current_time
+            else:
+                elapsed = current_time - self.suggestion_start_time
+                if elapsed >= DWELL_TIME:
+                    self.select_suggestion(suggestion)
+                    self.suggestion_start_time = current_time
+        else:
+            self.current_suggestion = None
+    
+    def update_suggestions(self):
+        if not self.prediction_words or not self.text:
+            self.suggestions = []
+            return
+            
+        if ' ' in self.text:
+            last_space = self.text.rfind(' ')
+            current_word = self.text[last_space+1:]
+        else:
+            current_word = self.text
+        
+        current_word = current_word.upper()
+        
+        self.suggestions = [
+            word for word in self.prediction_words 
+            if word.startswith(current_word)
+        ][:3]
+    
+    def get_suggestion_at_pos(self, cursor_pos):
+        if not self.suggestions or cursor_pos is None:
+            return None
+            
+        # Posición corregida para las sugerencias (lado derecho, no obstruye escritura)
+        for i, suggestion in enumerate(self.suggestions):
+            x = SCREEN_WIDTH - 200  # Lado derecho
+            y = 150 + i * 40  # Debajo del área de texto
+            
+            w = 180
+            h = 35
+            
+            if (x <= cursor_pos[0] <= x + w and 
+                y <= cursor_pos[1] <= y + h):
+                return suggestion
+        
+        return None
+    
+    def select_suggestion(self, suggestion):
+        if suggestion:
+            winsound.Beep(880, 100)
+            self.last_suggestion_selected_time = time.time()
+            
+            if ' ' in self.text:
+                last_space = self.text.rfind(' ')
+                self.text = self.text[:last_space+1] + suggestion + ' '
+            else:
+                self.text = suggestion + ' '
+            
+            self.update_suggestions()
+            self.current_suggestion = None
+
+def draw_interface(frame, keyboard, cursor_pos):
+    # Área de texto en edición
+    cv2.rectangle(frame, (0, 0), (SCREEN_WIDTH, TEXT_AREA_HEIGHT), (50, 50, 50), -1)
+    cv2.putText(frame, "Texto actual: " + keyboard.text, (20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    
+    # Área de texto final (enviado con enter)
+    cv2.rectangle(frame, (0, TEXT_AREA_HEIGHT), (SCREEN_WIDTH, TEXT_AREA_HEIGHT + 50), 
+                 (70, 70, 70), -1)
+    cv2.putText(frame, "Texto enviado: " + keyboard.final_text.strip(), (20, TEXT_AREA_HEIGHT + 35), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+    
+    # Sugerencias (lado derecho, no obstruye escritura)
+    for i, suggestion in enumerate(keyboard.suggestions):
+        x = SCREEN_WIDTH - 200  # Lado derecho
+        y = 150 + i * 40  # Debajo del área de texto
+        w = 180
+        h = 35
+        
+        is_selected = (cursor_pos and 
+                      keyboard.get_suggestion_at_pos(cursor_pos) == suggestion)
+        
+        color = (0, 200, 255) if is_selected else (0, 150, 255)
+        
+        if is_selected and keyboard.current_suggestion == suggestion:
+            elapsed = time.time() - keyboard.suggestion_start_time
+            progress = min(elapsed / DWELL_TIME, 1.0)
+            bar_width = int(w * progress)
+            cv2.rectangle(frame, (x, y), (x + bar_width, y + 5), (0, 255, 0), -1)
+        
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, -1)
+        cv2.putText(frame, suggestion, (x + 10, y + 25), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)  # Texto más pequeño
+    
+    # Teclado
+    for key in keyboard.keys:
+        progress = key['dwell_progress']
+        if progress > 0:
+            r = int(200 * (1 - progress))
+            g = int(200 * progress)
+            b = int(200 * (1 - progress))
+            color = (b, g, r)
+        else:
+            color = (200, 200, 200)
+        
+        if cursor_pos and keyboard.get_selected_key(cursor_pos) == key:
+            color = (0, 200, 255)
+        
+        x, y = key['pos']
+        w, h = key['size']
+        
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, -1)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (50, 50, 50), 2)
+        
+        if progress > 0:
+            bar_height = 5
+            bar_width = int(w * progress)
+            cv2.rectangle(frame, (x, y), (x + bar_width, y + bar_height), (0, 255, 0), -1)
+        
+        # Texto centrado
+        char = key['char']
+        if char == 'SPACE':
+            char = "ESPACIO"
+        elif char == 'ENTER':
+            char = "ENTER"
+            
+        text_size = cv2.getTextSize(char, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 1)[0]
+        text_x = x + (w - text_size[0]) // 2
+        text_y = y + (h + text_size[1]) // 2
+        
+        cv2.putText(frame, char, (text_x, text_y), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+    
+    # Cursor
+    if cursor_pos:
+        stability = min(eye_tracker.stability_counter / 10, 1.0)
+        cursor_color = (0, int(255 * stability), int(255 * (1 - stability)))
+        
+        cv2.circle(frame, cursor_pos, 10, cursor_color, -1)
+        cv2.circle(frame, cursor_pos, 12, (255, 255, 255), 2)
+    
+    if time.time() - keyboard.last_key_press_time > 0.5:
+        for key in keyboard.keys:
+            key['selected'] = False
+
+def main():
+    global eye_tracker
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Error: No se pudo acceder a la cámara")
+        return
+    
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, SCREEN_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, SCREEN_HEIGHT)
+    
+    eye_tracker = EyeTracker()
+    keyboard = VirtualKeyboard()
+    
+    cv2.namedWindow('Eye Typing System', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Eye Typing System', SCREEN_WIDTH, SCREEN_HEIGHT)
+    
+    try:
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                print("Error de cámara")
+                break
+            
+            frame = cv2.flip(frame, 1)
+            
+            if frame.shape[1] != SCREEN_WIDTH or frame.shape[0] != SCREEN_HEIGHT:
+                frame = cv2.resize(frame, (SCREEN_WIDTH, SCREEN_HEIGHT))
+            
+            cursor_pos = eye_tracker.detect_gaze(frame)
+            keyboard.update_dwell_times(cursor_pos)
+            keyboard.update_suggestions()
+            draw_interface(frame, keyboard, cursor_pos)
+            
+            cv2.imshow('Eye Typing System', frame)
+            
+            if cv2.waitKey(5) & 0xFF == 27:
+                break
+                
+    except Exception as e:
+        print(f"Error: {str(e)}")
+    finally:
+        with open('texto_escrito.txt', 'w', encoding='utf-8') as f:
+            f.write(keyboard.final_text + keyboard.text)
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    if not os.path.exists("palabras.txt"):
+        with open("palabras.txt", "w", encoding="utf-8") as f:
+            f.write("HOLA\nMUNDO\nPYTHON\nPROGRAMA\nTECLADO\nACCESIBILIDAD\n")
+    
+    main()
